@@ -7,6 +7,15 @@ class OpenAIContentGenerator {
       logger.info(`=== COMMENT GENERATION START ===`);
       logger.info(`Generating comment for post: "${post.title}"`);
       logger.info(`Recent posts context provided: ${recentPosts.length} posts`);
+      
+      // Log the actual post content being analyzed
+      logger.info(`=== TARGET POST CONTENT ANALYSIS ===`);
+      logger.info(`Post title: "${post.title}"`);
+      logger.info(`Post content length: ${post.content?.length || 0} characters`);
+      logger.info(`Post content preview: "${(post.content || '').substring(0, 200)}..."`);
+      logger.info(`Post author: ${post.author || 'unknown'}`);
+      logger.info(`Post timestamp: ${post.timestamp || 'unknown'}`);
+      
       logger.debug('Target post data received:', {
         title: post.title,
         contentLength: post.content?.length || 0,
@@ -16,6 +25,7 @@ class OpenAIContentGenerator {
         timestamp: post.timestamp,
         url: post.url
       });
+      
       logger.debug('Recent posts context received:', recentPosts.map(p => ({
         title: p.title,
         hasContent: !!p.content,

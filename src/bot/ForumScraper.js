@@ -301,33 +301,398 @@ class ForumScraper {
 
   async getPostContent(page, postUrl) {
     try {
-      await page.goto(postUrl);
-      // Wait for a reliable selector before scraping
-      await page.waitForSelector('.post-content, .message-content, .post-body, h1, .topic-title', { timeout: 15000 });
-      const content = await page.content();
-      const $ = cheerio.load(content);
+      logger.info(`=== GETTING POST CONTENT FROM: ${postUrl} ===`);
+      await page.goto(postUrl, { waitUntil: 'networkidle2' });
+      
+      // Wait for the page to fully load and render
+      await page.waitForTimeout(3000);
+      
+      // Wait for content to be rendered (not just the initial HTML)
+      await page.waitForFunction(() => {
+        // Check if the page has actual content rendered, not just hydration data
+        const body = document.body.innerText;
+        return body && body.length > 100 && !body.includes('$undefined') && !body.includes('__className_');
+      }, { timeout: 30000 });
+      
+      // Get the rendered content from the browser (not raw HTML)
+      const renderedContent = await page.evaluate(() => {
+        // Return the actual rendered text content, not HTML source
+        return {
+          bodyText: document.body.innerText,
+          bodyHTML: document.body.innerHTML,
+          title: document.title
+        };
+      });
+      
+      logger.debug(`Rendered content length: ${renderedContent.bodyText.length} characters`);
+      logger.debug('Rendered content preview:', renderedContent.bodyText.substring(0, 200));
+      
+      // Load the rendered HTML for parsing
+      const $ = cheerio.load(renderedContent.bodyHTML);
+      logger.debug(`Rendered HTML length: ${renderedContent.bodyHTML.length} characters`);
 
-      // Robust selector fallbacks for title
-      let title = $('.post-title, .topic-title, h1').first().text().trim();
-      if (!title) {
-        title = $('title').text().trim();
+      // Robust selector fallbacks for title - but avoid site title
+      let title = '';
+      
+      // First try to extract title from the rendered text directly
+      const fullText = renderedContent.bodyText;
+      const textLines = fullText.split('\n').map(line => line.trim());
+      
+      // Look for title patterns in the text - often appears after navigation
+      for (let i = 0; i < textLines.length && i < 20; i++) {
+        const line = textLines[i];
+        // Skip navigation and UI elements
+        if (line.length > 10 && line.length < 100 &&
+            !line.toLowerCase().includes('neoforum') &&
+            !line.toLowerCase().includes('explore') &&
+            !line.toLowerCase().includes('dashboard') &&
+            !line.toLowerCase().includes('back to forum') &&
+            !line.toLowerCase().includes('home') &&
+            !line.toLowerCase().includes('/') &&
+            !line.toLowerCase().includes('score') &&
+            !line.toLowerCase().includes('music') &&
+            !line.toLowerCase().includes('topic starter') &&
+            !line.toLowerCase().includes('edited') &&
+            !line.match(/^August \d+, \d+/) &&
+            line.split(' ').length > 2 && line.split(' ').length < 15) {
+          
+          // This might be our title
+          title = line.trim();
+          logger.debug(`Found potential title from rendered text: "${title}"`);
+          break;
+        }
       }
       
-      // Robust selector fallbacks for body
-      let body = $('.post-content, .message-content, .post-body').first().text().trim();
-      if (!body) {
-        body = $('article').text().trim();
+      // Fallback to HTML selectors if text extraction didn't work
+      if (!title) {
+        const titleSelectors = [
+          '.post-title',
+          '.topic-title', 
+          '.discussion-title',
+          'article h1',
+          'main h1',
+          '.content h1',
+          'h1:not(.site-title):not(.forum-title)',
+          'h2',
+          'h3'
+        ];
+        
+        for (const selector of titleSelectors) {
+          const titleElement = $(selector).first();
+          if (titleElement.length > 0) {
+            const titleText = titleElement.text().trim();
+            // Filter out obvious site/forum titles
+            if (titleText && 
+                titleText.toLowerCase() !== 'neoforum' &&
+                !titleText.toLowerCase().includes('forum') &&
+                !titleText.toLowerCase().includes('community') &&
+                !titleText.toLowerCase().includes('explore') &&
+                !titleText.toLowerCase().includes('dashboard') &&
+                titleText.length > 5 && titleText.length < 200) {
+              title = titleText;
+              logger.debug(`Found valid title with HTML selector "${selector}": "${title}"`);
+              break;
+            } else {
+              logger.debug(`Rejected title "${titleText}" from selector "${selector}" - looks like site/forum title`);
+            }
+          }
+        }
       }
-      if (!body) {
-        // Try more flexible selectors
-        body = $('.card, .rounded-lg, .group').first().text().trim();
+      
+      // Fallback to page title but filter
+      if (!title) {
+        const pageTitle = renderedContent.title || $('title').text().trim();
+        logger.debug(`Page title: "${pageTitle}"`);
+        // Extract post title from page title (e.g., "Post Title - NeoForum" -> "Post Title")
+        if (pageTitle.includes(' - ')) {
+          const parts = pageTitle.split(' - ');
+          const potentialTitle = parts[0].trim();
+          if (potentialTitle.toLowerCase() !== 'neoforum' && 
+              !potentialTitle.toLowerCase().includes('forum') &&
+              potentialTitle.length > 5) {
+            title = potentialTitle;
+            logger.debug(`Extracted title from page title: "${title}"`);
+          }
+        } else if (pageTitle && 
+                   pageTitle.toLowerCase() !== 'neoforum' && 
+                   !pageTitle.toLowerCase().includes('forum') &&
+                   pageTitle.length > 5 && pageTitle.length < 200) {
+          title = pageTitle;
+          logger.debug(`Using full page title: "${title}"`);
+        }
       }
-      if (!body) {
-        body = $('p').first().text().trim();
+      
+      logger.debug(`Final extracted title: "${title}"`);
+      
+      // Enhanced body extraction with rendered content focus
+      let body = '';
+      
+      // First, try to extract from the rendered text directly with intelligent filtering
+      const bodyText = renderedContent.bodyText;
+      logger.debug(`Full rendered text length: ${bodyText.length}`);
+      
+      // Split into lines and filter out navigation/UI elements
+      const lines = bodyText.split('\n')
+        .map(line => line.trim())
+        .filter(line => 
+          line.length > 20 && // Must be substantial
+          !line.toLowerCase().includes('neoforum') &&
+          !line.toLowerCase().includes('community based around') &&
+          !line.toLowerCase().includes('navigate') &&
+          !line.toLowerCase().includes('login') &&
+          !line.toLowerCase().includes('register') &&
+          !line.toLowerCase().includes('search') &&
+          !line.toLowerCase().includes('home') &&
+          !line.toLowerCase().includes('explore') &&
+          !line.toLowerCase().includes('dashboard') &&
+          !line.toLowerCase().includes('back to forum') &&
+          !line.toLowerCase().includes('©') &&
+          !line.toLowerCase().includes('privacy') &&
+          !line.toLowerCase().includes('terms') &&
+          !line.toLowerCase().includes('forum description') &&
+          !line.toLowerCase().includes('score') &&
+          !line.toLowerCase().includes('topic starter') &&
+          !line.toLowerCase().includes('edited') &&
+          !line.toLowerCase().includes('music') &&
+          !line.includes('$') && // Avoid React hydration data
+          !line.includes('__className_') &&
+          !line.includes('$undefined') &&
+          !line.includes('dangerouslySetInnerHTML') &&
+          !line.match(/^\d+\s+score$/) && // Filter out score lines
+          !line.match(/^August \d+, \d+/) && // Filter out date lines
+          !line.includes('/')  // Filter out breadcrumb navigation
+        );
+      
+      logger.debug(`Filtered to ${lines.length} meaningful lines`);
+      
+      // Look for the main post content in the filtered lines
+      if (lines.length > 0) {
+        logger.debug('Filtered lines:', lines.slice(0, 10)); // Log first 10 filtered lines for debugging
+        
+        // Find lines that look like actual post content (longer, more conversational)
+        // But also accept shorter lines if they seem to be the main content
+        const postLines = lines.filter(line => {
+          const words = line.split(' ');
+          return (
+            (line.length > 30 && words.length > 5) && // Substantial content
+            !line.toLowerCase().includes('reply') &&
+            !line.toLowerCase().includes('quote') &&
+            !line.toLowerCase().includes('edit') &&
+            !line.toLowerCase().includes('share') &&
+            !line.toLowerCase().includes('like') &&
+            !line.toLowerCase().includes('report') &&
+            !line.toLowerCase().includes('delete') &&
+            !line.toLowerCase().includes('bookmark') &&
+            // Exclude lines that are just post titles repeated
+            !line.toLowerCase().includes('weekly') ||
+            // Allow some specific content patterns even if shorter
+            line.toLowerCase().includes('discussion') ||
+            line.toLowerCase().includes('looking forward') ||
+            line.toLowerCase().includes('everyone') ||
+            line.toLowerCase().includes('thoughts') ||
+            line.toLowerCase().includes('opinion') ||
+            line.toLowerCase().includes('what do you think')
+          );
+        });
+        
+        logger.debug(`Found ${postLines.length} potential post content lines:`, postLines);
+        
+        if (postLines.length > 0) {
+          // Take the first few substantial lines as the post content
+          body = postLines.slice(0, 5).join(' ').trim();
+          logger.info(`✅ Found post content from rendered text (${body.length} chars)`);
+        } else if (lines.length > 0) {
+          // Fallback: if no "conversational" lines found, take the longest meaningful lines
+          const meaningfulLines = lines
+            .filter(line => line.length > 25 && line.split(' ').length > 4)
+            .sort((a, b) => b.length - a.length) // Sort by length, longest first
+            .slice(0, 3); // Take top 3 longest lines
+          
+          if (meaningfulLines.length > 0) {
+            body = meaningfulLines.join(' ').trim();
+            logger.warn(`⚠️ Using fallback meaningful lines as post content (${body.length} chars)`);
+          }
+        }
       }
+      
+      // Fallback to HTML parsing if rendered text extraction didn't work
+      if (!body || body.length < 100) {
+        logger.warn('Rendered text extraction insufficient, trying HTML parsing...');
+        
+        const bodySelectors = [
+          // Most specific - actual post content containers
+          '.post-content',
+          '.message-content', 
+          '.post-body',
+          '.topic-content',
+          '.discussion-content',
+          '.user-content',
+          
+          // Content within specific post containers
+          '.post .content',
+          '.message .content',
+          '.topic .content',
+          'article.post',
+          'article.message',
+          
+          // Main content area but exclude headers/navigation
+          'main .content:not(.forum-description):not(.category-description)',
+          '.main-content:not(.forum-description):not(.category-description)'
+        ];
+      
+        for (const selector of bodySelectors) {
+          logger.debug(`Trying body selector: ${selector}`);
+          const element = $(selector);
+          if (element.length > 0) {
+            const textContent = element.text().trim();
+            logger.debug(`Found content with selector "${selector}": ${textContent.length} chars - "${textContent.substring(0, 100)}..."`);
+            
+            // Much stricter validation for post content
+            const isValidPostContent = (
+              textContent.length > 100 && // Must be substantial
+              textContent.split(' ').length > 20 && // Must have enough words
+              textContent.split('\n').length < 50 && // Not too many line breaks (avoid navigation)
+              // Exclude obvious forum/site content and React hydration data
+              !textContent.toLowerCase().includes('neoforum') &&
+              !textContent.toLowerCase().includes('community based around') &&
+              !textContent.toLowerCase().includes('forum description') &&
+              !textContent.toLowerCase().includes('category:') &&
+              !textContent.toLowerCase().includes('navigate to') &&
+              !textContent.toLowerCase().includes('welcome to') &&
+              !textContent.toLowerCase().includes('©') &&
+              !textContent.toLowerCase().includes('privacy policy') &&
+              !textContent.toLowerCase().includes('terms of service') &&
+              !textContent.includes('$undefined') &&
+              !textContent.includes('__className_') &&
+              !textContent.includes('dangerouslySetInnerHTML') &&
+              !textContent.includes('$L') && // React components
+              // Must not be mostly navigation links
+              (textContent.match(/http/g) || []).length < textContent.split(' ').length * 0.1
+            );
+            
+            if (isValidPostContent) {
+              body = textContent;
+              logger.info(`✅ Found valid post body with HTML selector "${selector}" (${body.length} chars)`);
+              break;
+            } else {
+              logger.debug(`❌ Rejected content from selector "${selector}" - failed validation checks`);
+            }
+          }
+        }
+      }
+      
+      // If still no body, try to find the main post specifically
       if (!body) {
+        logger.warn('No specific post content found, trying post-specific search...');
+        
+        // Look for post containers specifically
+        const postContainers = [
+          '.post-container .content',
+          '.message-container .content',
+          '.topic-container .content',
+          '[data-post-id] .content',
+          '[class*="post-"] .content'
+        ];
+        
+        for (const selector of postContainers) {
+          const element = $(selector);
+          if (element.length > 0) {
+            const textContent = element.text().trim();
+            logger.debug(`Post container "${selector}" found: ${textContent.length} chars`);
+            
+            // Filter the content more aggressively
+            const filteredContent = textContent
+              .replace(/neoforum/gi, '')
+              .replace(/community based around.*?friends/gi, '')
+              .replace(/forum description.*?\./gi, '')
+              .trim();
+            
+            if (filteredContent.length > 50 && filteredContent.split(' ').length > 10) {
+              body = filteredContent;
+              logger.warn(`⚠️ Using filtered post container content: "${selector}"`);
+              break;
+            }
+          }
+        }
+      }
+      
+      // Final emergency fallback - with aggressive filtering
+      if (!body) {
+        logger.error('Still no post body found, using emergency fallback with aggressive filtering...');
+        
+        // Get all text content but aggressively filter
+        const allText = $('body').text();
+        const filteredText = allText
+          .replace(/neoforum/gi, '')
+          .replace(/community based around.*?friends/gi, '')
+          .replace(/forum description.*?\./gi, '')
+          .replace(/welcome to.*?forum/gi, '')
+          .replace(/category.*?:/gi, '')
+          .replace(/navigate.*?to/gi, '')
+          .replace(/privacy policy.*?/gi, '')
+          .replace(/terms of service.*?/gi, '')
+          .trim();
+        
+        // Try to extract meaningful paragraphs from the filtered text
+        const sentences = filteredText.split(/[.!?]+/)
+          .map(s => s.trim())
+          .filter(s => s.length > 30 && 
+                      s.split(' ').length > 5 &&
+                      !s.toLowerCase().includes('forum') &&
+                      !s.toLowerCase().includes('community') &&
+                      !s.toLowerCase().includes('navigate'))
+          .slice(0, 3); // Take first 3 meaningful sentences
+        
+        if (sentences.length > 0) {
+          body = sentences.join('. ') + '.';
+          logger.warn(`⚠️ Using emergency filtered fallback (${body.length} chars): "${body.substring(0, 100)}..."`);
+        }
+      }
+      
+      // If we still have obvious forum content or React data, reject it entirely
+      if (body) {
+        const suspiciousPatterns = [
+          'neoforum',
+          'community based around',
+          'furry best friends',
+          'forum description',
+          'welcome to',
+          '$undefined',
+          '__className_',
+          'dangerouslySetInnerHTML',
+          '$L',
+          'precedence',
+          'crossOrigin',
+          'nonce'
+        ];
+        
+        const hasSuspiciousContent = suspiciousPatterns.some(pattern => 
+          body.toLowerCase().includes(pattern.toLowerCase())
+        );
+        
+        if (hasSuspiciousContent) {
+          logger.error(`❌ Rejecting extracted content - contains forum description or React hydration patterns`);
+          logger.debug(`Rejected content: "${body.substring(0, 200)}..."`);
+          body = '';
+        }
+      }
+      
+      if (!body) {
+        logger.error('❌ Could not find any valid post content after all attempts');
         // Log a snippet of the HTML for debugging
-        logger.error('Post body not found. HTML snippet:', content.slice(0, 1000));
+        logger.error('HTML structure analysis:');
+        logger.debug('Available elements with content:');
+        $('*').each((i, el) => {
+          if (i < 10) { // Limit to first 10 elements
+            const tagName = el.tagName;
+            const className = $(el).attr('class') || '';
+            const textContent = $(el).text().trim();
+            if (textContent.length > 20 && textContent.length < 200) {
+              logger.debug(`${tagName}.${className}: "${textContent.substring(0, 100)}..."`);
+            }
+          }
+        });
+        return null;
       }
       
       // Author and timestamp
